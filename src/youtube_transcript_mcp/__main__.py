@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 import traceback
 
@@ -23,9 +22,10 @@ def _selftest(video_id: str) -> int:
     """Fetch one known video's metadata and transcript. Exit 2 if YouTube blocks
     the request, so an IP block is not mistaken for a code fault."""
     try:
-        meta = MetadataClient(read_api_key()).fetch(video_id)
+        api_key = read_api_key()
+        meta = MetadataClient(api_key).fetch(video_id)
         print(f"metadata   OK  source={meta['source']} title={meta['title']!r}")
-        if os.environ.get("YOUTUBE_API_KEY_FILE") and meta["source"] != "data-api":
+        if api_key and meta["source"] != "data-api":
             print(f"selftest FAIL: API key set but not used: {meta.get('note')}", file=sys.stderr)
             return EXIT_FAIL
         transcript = TranscriptClient().fetch(video_id)

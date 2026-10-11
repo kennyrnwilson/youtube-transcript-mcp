@@ -60,6 +60,5 @@ uv run python -m youtube_transcript_mcp                  # stdio
 uv run python -m youtube_transcript_mcp --transport streamable-http --port 5106
 ```
 
-`--selftest` fetches the metadata and transcript of one known video. If
-`YOUTUBE_API_KEY_FILE` is set, it also fails when the Data API does not accept
-the key.
+`--selftest` fetches the metadata and transcript of one known video. If a key
+is configured, it also fails when the Data API does not accept it.
