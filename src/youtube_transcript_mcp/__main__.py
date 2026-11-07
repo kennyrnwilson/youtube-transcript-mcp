@@ -34,7 +34,9 @@ def _selftest(video_id: str) -> int:
         print(f"transcript OK  language={transcript.track.language_code} chars={len(text)}")
         ffmpeg = shutil.which("ffmpeg")
         if not ffmpeg:
-            print("selftest FAIL: ffmpeg is not installed; the frame tools need it", file=sys.stderr)
+            print(
+                "selftest FAIL: ffmpeg is not installed; the frame tools need it", file=sys.stderr
+            )
             return EXIT_FAIL
         print(f"ffmpeg     OK  {ffmpeg}")
         return 0
