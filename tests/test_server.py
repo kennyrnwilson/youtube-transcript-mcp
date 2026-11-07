@@ -31,6 +31,8 @@ async def test_tools_listed():
         "list_transcript_languages",
         "get_transcript",
         "get_video",
+        "get_contact_sheet",
+        "get_frames",
     }
 
 

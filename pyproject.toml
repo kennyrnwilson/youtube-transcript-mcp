@@ -10,7 +10,9 @@ requires-python = ">=3.12"
 dependencies = [
     "google-api-python-client>=2.201.0",
     "mcp>=1.12,<2",
+    "pillow>=11",
     "youtube-transcript-api>=1.2.4",
+    "yt-dlp>=2025.10",
 ]
 
 [project.optional-dependencies]

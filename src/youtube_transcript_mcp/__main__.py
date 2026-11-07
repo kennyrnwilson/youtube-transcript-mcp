@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import shutil
 import sys
 import traceback
 
@@ -31,6 +32,11 @@ def _selftest(video_id: str) -> int:
         transcript = TranscriptClient().fetch(video_id)
         text = transcript.render()
         print(f"transcript OK  language={transcript.track.language_code} chars={len(text)}")
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            print("selftest FAIL: ffmpeg is not installed; the frame tools need it", file=sys.stderr)
+            return EXIT_FAIL
+        print(f"ffmpeg     OK  {ffmpeg}")
         return 0
     except YouTubeError as e:
         status = "BLOCKED" if e.code == "blocked" else "FAIL"

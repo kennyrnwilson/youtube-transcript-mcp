@@ -1,23 +1,50 @@
 """FastMCP server: YouTube video metadata and transcripts.
 
-Read-only and stateless. Failures surface as tool errors whose message starts
-with one of the codes in ``errors.py``.
+The transcript tools are read-only and stateless. The frame tools download a
+video once into ``YOUTUBE_MCP_DATA_DIR`` and cut frames and contact sheets from
+it; they return the image inline, so the model sees it, and a signed link, so a
+client with a shell can save it. Failures surface as tool errors whose message
+starts with one of the codes in ``errors.py``.
 """
 
 from __future__ import annotations
 
+import asyncio
+import base64
+import hashlib
+import os
+import time
+from pathlib import Path
 from typing import Any
 
 import anyio
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
+from mcp.types import ContentBlock, ImageContent, ResourceLink, TextContent
 
 from youtube_transcript_mcp.errors import YouTubeError
+from youtube_transcript_mcp.frames import FrameStore, label_time, parse_time, shrink
 from youtube_transcript_mcp.metadata import MetadataClient, read_api_key
 from youtube_transcript_mcp.transcript import TranscriptClient, page
 from youtube_transcript_mcp.video_id import require_video_id
 
 DEFAULT_MAX_CHARS = 60_000
+MAX_FRAMES_PER_CALL = 12
+SHEET_PREVIEW_WIDTH = 1600
+FRAME_PREVIEW_WIDTH = 640
+
+
+def sign(uri: str, exp: int, secret: str) -> str:
+    """nginx secure_link: base64url(MD5(<exp><uri><secret>)), unpadded. Secret last."""
+    digest = hashlib.md5(f"{exp}{uri}{secret}".encode()).digest()
+    return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+
+
+def _secret_from_env() -> str | None:
+    path = os.environ.get("YOUTUBE_FRAMES_URL_SECRET_FILE")
+    if path:
+        return Path(path).read_text().strip()
+    return os.environ.get("YOUTUBE_FRAMES_URL_SECRET")
 
 
 def _transcript_page(
@@ -51,9 +78,24 @@ def build_server(
     port: int = 5106,
     transcripts: TranscriptClient | None = None,
     metadata: MetadataClient | None = None,
+    frames: FrameStore | None = None,
+    url_secret: str | None = None,
+    public_base: str | None = None,
+    url_path: str = "/mcp/youtube/frames/",
+    url_ttl: int = 3600,
+    clock=time.time,
 ) -> FastMCP:
     transcripts = transcripts or TranscriptClient()
     metadata = metadata or MetadataClient(read_api_key())
+    if frames is None:
+        data_dir = Path(os.environ.get("YOUTUBE_MCP_DATA_DIR", "/var/lib/youtube-mcp"))
+        max_duration = int(os.environ.get("YOUTUBE_MCP_MAX_VIDEO_SECONDS", "3600"))
+        frames = FrameStore(data_dir, max_duration=max_duration)
+    url_secret = url_secret if url_secret is not None else _secret_from_env()
+    public_base = public_base or os.environ.get(
+        "YOUTUBE_MCP_PUBLIC_BASE", "https://gateway.kennyrnwilson.com"
+    )
+    video_locks: dict[str, asyncio.Lock] = {}
 
     mcp = FastMCP(
         "youtube-transcript",
@@ -63,7 +105,11 @@ def build_server(
             "Fetch a YouTube video's metadata and transcript. Use get_video for the "
             "common case; page long transcripts with get_transcript(offset=next_offset). "
             "Errors start with a code: invalid_video_id, video_unavailable, no_transcript, "
-            "or blocked (YouTube refused the server; not a property of the video)."
+            "or blocked (YouTube refused the server; not a property of the video). "
+            "To illustrate a video, read the transcript with timestamps, look at "
+            "get_contact_sheet for the stretch where a point is made, then take the "
+            "clearest moments with get_frames. A frame's file name is a valid source "
+            "for image-gen's edit_image."
         ),
     )
 
@@ -72,6 +118,109 @@ def build_server(
             return await anyio.to_thread.run_sync(fn, *args)
         except YouTubeError as e:
             raise ToolError(str(e)) from e
+        except ValueError as e:
+            raise ToolError(f"invalid_request: {e}") from e
+
+    def _link(path: Path) -> tuple[str | None, ResourceLink | None]:
+        if not url_secret:
+            return None, None
+        uri = f"{url_path}{path.name}"
+        exp = int(clock()) + url_ttl
+        url = f"{public_base.rstrip('/')}{uri}?exp={exp}&sig={sign(uri, exp, url_secret)}"
+        link = ResourceLink(
+            type="resource_link",
+            uri=url,
+            name=path.name,
+            mimeType="image/jpeg",
+            size=path.stat().st_size,
+        )
+        return url, link
+
+    def _image(data: bytes) -> ImageContent:
+        return ImageContent(
+            type="image", data=base64.b64encode(data).decode("ascii"), mimeType="image/jpeg"
+        )
+
+    async def _with_video_lock(video_id: str, fn):
+        lock = video_locks.setdefault(video_id, asyncio.Lock())
+        async with lock:
+            return await _run(fn)
+
+    @mcp.tool(structured_output=False)
+    async def get_contact_sheet(
+        url_or_id: str, start: str = "0:00", end: str | None = None, fps: float = 2.0
+    ) -> list[ContentBlock]:
+        """A grid of frames from part of a video, each labelled with its time, to
+        choose which moments to illustrate. Shown inline.
+
+        - start, end: "m:ss", "h:mm:ss" or seconds. end defaults to the end of the
+          video. Speech usually leads the matching picture by a few seconds.
+        - fps: frames per second of video, before thinning. A sheet holds at most
+          64 frames, so a long range is spaced out evenly; narrow the range to see
+          more detail.
+
+        The first call for a video downloads it, which takes a few seconds."""
+        video_id = require_video_id(url_or_id)
+        start_s = parse_time(start)
+        end_s = parse_time(end) if end else None
+        sheet = await _with_video_lock(
+            video_id, lambda: frames.sheet(video_id, start_s, end_s, fps)
+        )
+        data = sheet.path.read_bytes()
+        url, link = _link(sheet.path)
+        text = (
+            f"Contact sheet: {len(sheet.times)} frames, {label_time(sheet.times[0])} to "
+            f"{label_time(sheet.times[-1])}, labelled with their times. Take the ones you "
+            f"want with get_frames(times=[...])."
+        )
+        if url:
+            text += f"\nFull-size sheet (link expires in {url_ttl // 60} min): {url}"
+        blocks: list[ContentBlock] = [TextContent(type="text", text=text)]
+        blocks.append(_image(shrink(data, SHEET_PREVIEW_WIDTH)))
+        if link:
+            blocks.append(link)
+        return blocks
+
+    @mcp.tool(structured_output=False)
+    async def get_frames(
+        url_or_id: str, times: list[str], preview: bool = True
+    ) -> list[ContentBlock]:
+        """Full-resolution stills from a video at the given times, up to 12 a call.
+
+        - times: each "m:ss", "m:ss.s", "h:mm:ss" or seconds, e.g. ["0:18.5", "33"].
+        - preview: show each frame inline (scaled down) so you can check it.
+
+        Each frame comes with a signed download link (curl -fsSL -o <file>.jpg
+        '<url>') and its file name, frame-<32 hex>.jpg. Pass that name or link to
+        image-gen's edit_image as `source` to annotate or change the frame."""
+        video_id = require_video_id(url_or_id)
+        if not times:
+            raise ValueError("give at least one time")
+        if len(times) > MAX_FRAMES_PER_CALL:
+            raise ValueError(f"at most {MAX_FRAMES_PER_CALL} frames a call")
+        seconds = [parse_time(t) for t in times]
+        paths = await _with_video_lock(
+            video_id, lambda: [frames.frame(video_id, s) for s in seconds]
+        )
+        blocks: list[ContentBlock] = []
+        for s, path in zip(seconds, paths, strict=True):
+            url, link = _link(path)
+            text = f"Frame at {label_time(s)}: {path.name}"
+            if url:
+                text += f"\ncurl -fsSL -o <path>.jpg '{url}'"
+            blocks.append(TextContent(type="text", text=text))
+            if preview:
+                blocks.append(_image(shrink(path.read_bytes(), FRAME_PREVIEW_WIDTH)))
+            if link:
+                blocks.append(link)
+        if url_secret:
+            blocks.append(
+                TextContent(
+                    type="text",
+                    text=f"Links expire in {url_ttl // 60} minutes; download straight away.",
+                )
+            )
+        return blocks
 
     @mcp.tool()
     async def get_video_metadata(url_or_id: str) -> dict[str, Any]:
